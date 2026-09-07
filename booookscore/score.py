@@ -34,46 +34,49 @@ class Scorer():
         self.batch_size = batch_size
         self.all_labels = ['entity omission', 'event omission', 'causal omission', 'salience', 'discontinuity', 'duplication', 'inconsistency', 'language']
 
+    def parse_object(self, response):
+        start_index = response.find("{")
+        end_index = response.rfind("}") + 1
+        if start_index == -1 or end_index == 0:
+            raise ValueError("No JSON object found in the response")
+        return json.loads(response[start_index:end_index])
+
+    def normalize_list(self, value):
+        """Accept a list of strings, a comma-separated string, or an empty value."""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [v for v in value.split(', ')]
+        if not isinstance(value, list):
+            raise ValueError(f"Expected a list or a string, got {type(value)}")
+        return [str(v).strip() for v in value if str(v).strip()]
+
     def validate_response(self, response):
-        lines = response.split('\n')
-        
-        # only keep the lines with questions and types
-        lines = [line for line in lines if "Questions: " in line or "Types: " in line]
-
-        if len(lines) < 2:
-            print("Number of lines is less than 2: ", lines)
+        try:
+            answer = self.parse_object(response)
+            questions = self.normalize_list(answer.get("questions"))
+            types = self.normalize_list(answer.get("types"))
+        except Exception as e:
+            print(f"Failed to parse the response: {e}")
             return False, [], []
 
-        questions_pos = lines[0].find("Questions: ")
-        types_pos = -1
-        types_pos = lines[1].find("Types: ")
+        # "no confusion" was the pre-JSON way of saying that a field is empty
+        questions = [q for q in questions if q.lower() != "no confusion"]
+        types = [t.lower() for t in types if t.lower() != "no confusion"]
 
-        if questions_pos == -1 or types_pos == -1:
-            print("Questions or types not found")
-            return False, [], []
-        
-        questions = lines[0][questions_pos + len("Questions: "):].strip()
-        types = lines[1][types_pos + len("Types: "):].strip()
-        types = types.lower()
-
-        if "no confusion" in questions:
-            if "no confusion" not in types:
-                print("No confusion in questions but not in types")
+        for t in types:
+            if t not in self.all_labels:
+                print(f"Invalid type: {t}")
                 return False, [], []
-            else:
-                return True, None, None
 
-        if types is not None:
-            types = types.split(', ')
-            for t in types:
-                if t.lower() not in self.all_labels:
-                    print(f"Invalid type: {t}")
-                    return False, [], []
-        
-        if questions is not None and types is None:
-            raise ValueError("Questions is not None but types is None")
+        if bool(questions) != bool(types):
+            print(f"Questions and types disagree: {questions} / {types}")
+            return False, [], []
 
-        return True, questions, types
+        if not questions:
+            return True, None, None
+
+        return True, ' '.join(questions), types
 
     def gen_batch(self, records: List[Any], batch_size: int):
         batch_start = 0
@@ -139,12 +142,16 @@ class Scorer():
 
             if not self.v2:
                 for i, sentence in tqdm(enumerate(sentences), total=len(sentences), desc="Iterating over sentences"):
-                    prompt = template.format(summary, sentence)
-                    response = self.client.obtain_response(prompt, max_tokens=1000, temperature=0)
-                    valid, questions, types = self.validate_response(response)
-                    while not valid:
+                    prompt = template.format(summary=summary, sentence=sentence)
+                    valid = False
+                    for attempt in range(num_retries):
                         response = self.client.obtain_response(prompt, max_tokens=max_len, temperature=0)
                         valid, questions, types = self.validate_response(response)
+                        if valid:
+                            break
+                        print(f"Invalid response (attempt {attempt + 1}/{num_retries}), retrying...")
+                    if not valid:
+                        raise ValueError(f"Failed to get a valid annotation after {num_retries} attempts:\n{response}")
                     annots[book][sentence] = {
                         'questions': questions,
                         'types': types
